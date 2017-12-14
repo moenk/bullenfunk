@@ -15,6 +15,7 @@ import os.path
 import locale
 import psycopg2
 import pyautogui
+import subprocess
 import pandas as pd
 import numpy as np
 import tempfile
@@ -28,8 +29,10 @@ from datetime import datetime, timedelta
 
 
 # datenbank erstellen
-def create_db():
+def create_db(conn):
     commands = (
+        """ drop view if exists kandidaten;
+        """,
         """ drop table if exists kurse;
         """,
         """ CREATE TABLE kurse (
@@ -51,11 +54,12 @@ def create_db():
             aktien_isin VARCHAR(25),
             aktien_name VARCHAR(250),
             aktien_url VARCHAR(250),
+            aktien_bid FLOAT,
+            aktien_ask FLOAT,
             aktien_perf FLOAT,
             aktien_deter FLOAT,
             aktien_buysell INTEGER,
-            aktien_bid FLOAT,
-            aktien_ask FLOAT,
+            aktien_days INTEGER,
             aktien_backtest FLOAT
         );
         """,
@@ -69,19 +73,17 @@ def create_db():
             depot_stopdate DATE
         );
         """,
-        """ drop view if exists kandidaten;
-        """,
         """ create view kandidaten 
             as select * from aktien 
-                where aktien_deter>0.7
-                and aktien_perf>5
+                where aktien_deter>0.9
+                and aktien_perf>0.0
             order by aktien_perf desc;
         """
         )
-    global conn
     cur = conn.cursor()
     # create table one by one
     for command in commands:
+        print(command)
         cur.execute(command)
     # close communication with the PostgreSQL database server
     cur.close()
@@ -91,6 +93,19 @@ def create_db():
     except:
         print (exception)
         sys.exit(1)
+
+
+# sind wir alleine hier oder geht schon was?
+def allein_zu_haus():
+    scount=0
+    s = subprocess.check_output('tasklist', shell=True)
+    for s3 in str(s).split(" "):
+        if ("python" in s3):
+            scount=scount+1
+    allein=False
+    if scount==1:
+        allein=True
+    return allein
 
 
 # kind of value function
@@ -116,28 +131,33 @@ def expert_advisor(px,day):
     bollfaktor = 2.0
     bolltage = 20
     buysell = 0
+    px['ewm'] = px['kurs_close'].ewm(span=90).mean()
     px['bb0'] = px['kurs_close'].rolling(window=bolltage).mean()
     px['std'] = px['kurs_close'].rolling(window=bolltage).std()
     px['bb1'] = px['bb0'] + (px['std'] * bollfaktor)
     px['bb2'] = px['bb0'] - (px['std'] * bollfaktor)
     px['bbp'] = (px['kurs_close'] - px['bb2']) / (px['bb1'] - px['bb2'])
     rsiday=rsi(px['kurs_close'][day-13:day])
-    diffboll = px['bb0'].diff(1)
-    # gerade preiswert?
-    if (px['bbp'][day] < 0.1) and (rsiday < 0.3) and (diffboll[day] > -0.1):
-        #and (dsma90[day]>0.0):
-        #print(dbolltage[day])
+    # gerade preiswert? knappes kauf-fenster intraday
+    #if (px['bbp'][day - 1] < 0.0) and (px['bbp'][day] > 0.0) and (px['bbp'][day] < 0.1) and (rsiday < 0.3):
+    if (px['kurs_close'][day] > px['ewm'][day]):
+    #if (rsiday < 0.3):
         buysell = 1
-    # ziel erreicht!
-    if (px['bbp'][day] > 0.5) or (rsiday > 0.7):
-        # or (px['bbp'][day] < -0.2):
+    # ziel erreicht! und raus damit
+    #if (px['bbp'][day] > 0.45) or (rsiday > 0.7):
+    if (px['kurs_close'][day] < px['ewm'][day]):
+    #if (rsiday > 0.7):
         buysell = -1
-    #print (day,rsiday,diffboll[day])
+    # bei fallendem kurs unter bollinger
+    #if  (px['bbp'][day-1] > 0.0) and (px['bbp'][day] < 0.0):
+    #    buysell = -1
+    # am selben tag kein neukauf mehr da vergleich mit vortag
     return buysell
 
 
-# holt alle realtimekurse von finanzen.net
-def update_aktien_realtime(url):
+# holt alle realtimekurse von boerse online
+def update_aktien_realtime_boerse(conn,url):
+    print ("*** Hole Kurse von "+url+" ***")
     locale.setlocale(locale.LC_ALL, 'deu_deu')
     cur = conn.cursor()
     driver = webdriver.Firefox()
@@ -148,161 +168,145 @@ def update_aktien_realtime(url):
     except:
         time.sleep(15)
         pass
-    #assert "Realtime" in driver.title
     html = driver.page_source
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.find_all('table', attrs={'class': 'table table-vertical-center'})
-    # isin aus zweiten spalte der fehlerhaften tabelle
     for row in soup.find_all("tr"):
-        print("***")
         aktien_isin=""
         cols = row.find_all("td")
-        # wenn eine zeile mit 10 werten dann haben wir daten
-        if (len(cols)==10):
-            # der name ist vorn klickbarer titel
-            for a in cols[1].find_all('a', title=True):
-                b=a['title']
-                aktien_name=b
-                c=a['href']
-                aktien_url="http://www.finanzen.net"+c
-            print (aktien_name)
-            print (aktien_url)
-            # in der CFD url ist irgendwo die ISIN drin
-            for a in cols[2].find_all('a', href=True):
-                b=a['href']
-                c=b.split("%")
-                aktien_isin=c[11][2:]
-            print (aktien_isin)
-            aktien_bid=cell2float(cols[4].text)
-            print (aktien_bid)
-            aktien_ask=cell2float(cols[5].text)
-            print (aktien_ask)
+        if (len(cols)==8):
+            #for a in cols[0].find_all('a', title=True):
+            #    aktien_url="http://www.boerse-online.de"+a['href']
+            aktien_index=url[49:]
+            aktien_name = cols[0].text.strip()
+            aktien_isin = cols[1].text.strip()
+            aktien_bid = cell2float(cols[3].text)
+            aktien_ask = cell2float(cols[4].text)
+            if (aktien_ask==0.0):
+                aktien_ask=cell2float(cols[2].text)
             kurs_datum = time.strftime("%Y-%m-%d")
             kurs_close = np.mean([aktien_bid, aktien_ask])
-        # und rein damit
-        if (aktien_isin!=""):
+            kurs_vortag = cell2float(cols[2].text)
+            yesterday = datetime.now() - timedelta(days=1)
+            date_gestern = yesterday.strftime("%Y-%m-%d")
+        # eintragen wenn ISIN gueltig und kurs auch
+        if (aktien_isin!="") and (aktien_bid>0.0):
+            print(aktien_isin, aktien_name, aktien_index, aktien_bid, aktien_ask, kurs_datum)
             cur.execute("delete from aktien where aktien_isin=%s;",(aktien_isin,))
-            cur.execute("insert into aktien (aktien_isin,aktien_name,aktien_url,aktien_bid,aktien_ask) values (%s,%s,%s,%s,%s);",(aktien_isin,aktien_name,aktien_url,aktien_bid,aktien_ask))
+            cur.execute("insert into aktien (aktien_isin,aktien_name,aktien_url,aktien_bid,aktien_ask) values (%s,%s,%s,%s,%s);",(aktien_isin,aktien_name,aktien_index,aktien_bid,aktien_ask))
             cur.execute("delete from kurse where kurs_isin=%s and kurs_date=%s;",(aktien_isin,kurs_datum))
             cur.execute("insert into kurse (kurs_isin,kurs_date,kurs_close) values (%s,%s,%s);",(aktien_isin,kurs_datum,kurs_close))
+            cur.execute("delete from kurse where kurs_isin=%s and kurs_date=%s;",(aktien_isin,date_gestern))
+            cur.execute("insert into kurse (kurs_isin,kurs_date,kurs_close) values (%s,%s,%s);",(aktien_isin,date_gestern,kurs_vortag))
     # und feierabend
     cur.close()
     conn.commit()
     driver.close()
 
 
-# komplette bewertung der aktie
-def aktien_rating(kurs_isin):
-    # alle kursdaten holen
-    zeitrahmen = 200
-    global conn
-    command = "SELECT kurs_date, kurs_close from kurse as k where kurs_isin='" + kurs_isin + "' and kurs_date > NOW() - INTERVAL '" + str(
-        zeitrahmen) + " days' order by kurs_date asc;"
-    df = pd.read_sql(command, con=conn)
-    # lineare regression, erst vorbereiten
+def optimierte_lineare_regression(df):
     letzter = len(df['kurs_close'])-1
     reg = linear_model.LinearRegression()
     df['kurs_date2'] = pd.to_datetime(df['kurs_date'])
     df['date_delta'] = (df['kurs_date2'] - df['kurs_date2'].min()) / np.timedelta64(1, 'D')
     kurse = df['kurs_close']
     tage = df[['date_delta']]
-    # dann besten fit durch test suchen in 90% der ersten daten = bollinger tage
+    # dann besten fit durch test suchen in 90% der ersten daten
     bestfit = 1
     bestscore = 0
-    for i in range(1, letzter // 10 * 9):
+    # teste erste 80% pareto verteilung trainingsmenge
+    for i in range(1, (letzter // 5 * 4)):
         reg.fit(tage[i:letzter], kurse[i:letzter])
         thisscore = reg.score(tage[i:letzter], kurse[i:letzter])
         if (thisscore > bestscore):
             bestfit = i
             bestscore = thisscore
     trenddays = df['date_delta'][letzter] - df['date_delta'][bestfit]
-    print("Trend days: " + str(trenddays))
     reg.fit(tage[bestfit:letzter], kurse[bestfit:letzter])
     # und dann erst vorhersage auf basis des besten fits
     df['kurs_predict'] = reg.predict(df[['date_delta']])
     aktie_deter = reg.score(tage[bestfit:letzter], kurse[bestfit:letzter])
-    print("Bestimmtheit: " + str(aktie_deter))
-    # performance auf den betrachteten zeitraum entsprechend linearer regression
-    performance = 100 * ((df['kurs_predict'][letzter] - df['kurs_predict'][0]) / df['kurs_predict'][0])
-    print("Performance: " + str(performance) + " % p.a.")
+    performance = reg.coef_[0]
+    return (aktie_deter,performance,trenddays)
+
+
+# komplette bewertung der aktie
+def aktien_rating(conn,kurs_isin):
+    # alle kursdaten holen
+    zeitrahmen = 233
+    command = "SELECT kurs_date, kurs_close from kurse as k where kurs_isin='" + kurs_isin + "' and kurs_date > NOW() - INTERVAL '" + str(
+        zeitrahmen) + " days' order by kurs_date asc;"
+    df = pd.read_sql(command, con=conn)
+    # lineare regression, erst vorbereiten
+    aktie_deter, performance, trenddays = optimierte_lineare_regression(df)
     # EA aufrufen
+    letzter = len(df['kurs_close'])-1
     buysell=expert_advisor(df,letzter)
-    # ergebnisse speichern der aktie
+    # ergebnisse der aktie speichern
     cur = conn.cursor()
-    print ("*** Eintrag: "+kurs_isin+" ***")
-    cur.execute("update aktien set (aktien_perf,aktien_deter,aktien_buysell) = (%s,%s,%s) where aktien_isin = %s;",(performance,aktie_deter,buysell,kurs_isin))
+    print (kurs_isin, str(aktie_deter), str(performance), str(trenddays), buysell)
+    cur.execute("update aktien set (aktien_perf,aktien_deter,aktien_buysell,aktien_days) = (%s,%s,%s,%s) where aktien_isin = %s;",(performance,aktie_deter,buysell,trenddays,kurs_isin))
     cur.close()
     conn.commit()
 
 
 # holt historische kurse
-def hole_historische_kurse(aktien_isin):
+def hole_historische_kurse_boerse(conn,aktien_isin):
     locale.setlocale(locale.LC_ALL, 'deu_deu')
-    global conn
     cur = conn.cursor()
-    cur.execute("select aktien_url from aktien where aktien_isin=%s;",(aktien_isin,))
-    row = cur.fetchone()
-    kurse_url = row[0]
-    if ("index" in kurse_url):
-        kurse_url = kurse_url+ "/Historisch"
-    else:
-        kurse_url = kurse_url.replace("/aktien/", "/historische-kurse/")
-    kurse_url = kurse_url.replace("-Aktie", "")
     driver = webdriver.Firefox()
-    try:
-        driver.get(kurse_url)
-    except:
-        time.sleep(5)
-        pass
-    el = driver.find_element_by_name('inJahr2')
+    driver.get("http://www.boerse-online.de/")
+    el=driver.find_element_by_id("searchvalue")
+    time.sleep(3)
+    el.click()
+    el.send_keys(aktien_isin)
+    el.submit()
+    time.sleep(8)
+    el = driver.find_element_by_link_text("Historisch")
+    el.click()
+    time.sleep(2)
+    el = driver.find_element_by_id('historic-prices-start-year')
     for option in el.find_elements_by_tag_name('option'):
-        if option.text == '2015':
+        if option.text == '2014':
             option.click()
             break
-    content = driver.find_element_by_css_selector("span.button")
-    print (content)
-    #content = driver.find_element_by_xpath("//span[text()='Historische Kurse anzeigen']")
+    content = driver.find_element_by_id("request-historic-price")
     content.click()
+    time.sleep(5)
     html = driver.page_source
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.find_all('table', attrs={'class': 'table'})[3]
-    headings = [th.get_text() for th in table.find("tr").find_all("th")]
-    cur = conn.cursor()
-    for row in table.find_all("tr")[1:]:
+    for row in soup.find_all("tr"):
         cols = [td.get_text() for td in row.find_all("td")]
-        kurs_date = cols[0]
-        if (kurs_date.count(".") == 2):
-            kurs_date = datetime.strptime(kurs_date, '%d.%m.%Y')
-            kurs_date = kurs_date.strftime("%Y-%m-%d")
-            kurs_open = cell2float(cols[1])
-            kurs_close = cell2float(cols[2])
-            kurs_high = cell2float(cols[3])
-            kurs_low = cell2float(cols[4])
-            kurs_count = cell2float(cols[5])
-            cur.execute("delete from kurse where kurs_date = %s and kurs_isin = %s;",(kurs_date,aktien_isin))
-            cur.execute(
-                "insert into kurse (kurs_isin,kurs_date,kurs_open,kurs_close,kurs_high,kurs_low,kurs_count) values (%s,%s,%s,%s,%s,%s,%s);",
-                (aktien_isin, kurs_date, kurs_open, kurs_close, kurs_high, kurs_low, kurs_count))
-            print(aktien_isin + ": " + kurs_date + " -> " + str(kurs_close))
+        if (len(cols)==6):
+            kurs_date = cols[0]
+            if (kurs_date.count(".") == 2):
+                kurs_date = datetime.strptime(kurs_date, '%d.%m.%Y')
+                kurs_date = kurs_date.strftime("%Y-%m-%d")
+                kurs_open = cell2float(cols[1])
+                kurs_close = cell2float(cols[2])
+                kurs_high = cell2float(cols[3])
+                kurs_low = cell2float(cols[4])
+                kurs_count = cell2float(cols[5])
+                cur.execute("delete from kurse where kurs_date = %s and kurs_isin = %s;",(kurs_date,aktien_isin))
+                cur.execute("insert into kurse (kurs_isin,kurs_date,kurs_open,kurs_close,kurs_high,kurs_low,kurs_count) values (%s,%s,%s,%s,%s,%s,%s);",(aktien_isin, kurs_date, kurs_open, kurs_close, kurs_high, kurs_low, kurs_count))
+                print(aktien_isin,kurs_close,kurs_date)
     cur.close()
     conn.commit()
     driver.quit()
 
 
 # holt die aktuellen kurse aus alle aktien listen
-def hole_alle_aktien_kurse():
-    update_aktien_realtime("http://www.finanzen.net/aktien/DAX-Realtimekurse")
-    update_aktien_realtime("http://www.finanzen.net/aktien/MDAX-Realtimekurse")
-    update_aktien_realtime("http://www.finanzen.net/aktien/SDAX-Realtimekurse")
-    update_aktien_realtime("http://www.finanzen.net/aktien/TecDAX-Realtimekurse")
-    update_aktien_realtime("http://www.finanzen.net/aktien/Dow_Jones-Realtimekurse")
-    update_aktien_realtime("http://www.finanzen.net/aktien/Euro_Stoxx_50-Realtimekurse")
-    update_aktien_realtime("http://www.finanzen.net/aktien/ATX-Realtimekurse")
+def hole_alle_aktien_kurse(conn):
+    update_aktien_realtime_boerse(conn,"http://www.boerse-online.de/aktien/realtimekurse/Dow_Jones")
+    update_aktien_realtime_boerse(conn,"http://www.boerse-online.de/aktien/realtimekurse/Euro_Stoxx_50")
+    update_aktien_realtime_boerse(conn,"http://www.boerse-online.de/aktien/realtimekurse/TecDAX")
+    update_aktien_realtime_boerse(conn,"http://www.boerse-online.de/aktien/realtimekurse/SDAX")
+    update_aktien_realtime_boerse(conn,"http://www.boerse-online.de/aktien/realtimekurse/MDAX")
+    update_aktien_realtime_boerse(conn,'http://www.boerse-online.de/aktien/realtimekurse/DAX')
 
 
 # rating aller aktien
-def bewerte_alle_aktien():
-    global conn
+def bewerte_alle_aktien(conn):
+    print ("*** Lineare Regression und Bewertung ***")
     cur = conn.cursor()
     cur.execute("""
                 select f.anzahl, a.aktien_isin, a.aktien_url, f.letzter from 
@@ -314,8 +318,20 @@ def bewerte_alle_aktien():
     rows = cur.fetchall()
     cur.close()
     for row in rows:
-        #hole_historische_kurse(row[1])
-        aktien_rating(row[1])
+        aktien_rating(conn,row[1])
+
+
+# alle historischen kurse holen wenn frischer titel in listen
+def hole_alle_historischen_kurse(conn):
+    cur = conn.cursor()
+    cur.execute("select * from (select kurs_isin, count(*) as anzahl from kurse group by kurs_isin) as k where anzahl=2;")
+    rows = cur.fetchall()
+    cur.close()
+    for row in rows:
+        try:
+            hole_historische_kurse_boerse(conn,row[0])
+        except:
+            pass
 
 
 # automate the boring stuff with python
@@ -430,24 +446,22 @@ def kaufe_aktien(aktien_isin,betrag):
     anzahl=math.floor(betrag/row[1])
     quickorder="K;EDE;"+row[0] + ";"+str(anzahl)+";M"
     print ("Order: "+quickorder)
-    time.sleep(5)
-    onvista_quick_order(quickorder)
+    #onvista_quick_order(quickorder)
     cur.execute("delete from depot where depot_isin = %s;",(aktien_isin,))
     cur.execute("insert into depot (depot_isin,depot_anzahl) values (%s,%s);",(aktien_isin,anzahl))
     cur.close()
     conn.commit()
 
 
-orderglobal=0
 # strategie zur aktie pruefen und bei bedarf diagramm erstellen und tweeten
-def backtest_expert(aktien_isin, zeitrahmen, diagramm, zwitschern):
+def backtest_expert(conn, aktien_isin, zeitrahmen, diagramm, zwitschern):
     print ("*** Starte Backtest: "+aktien_isin+" ***")
-    global conn
     global orderglobal
-    command = "SELECT k.kurs_date, k.kurs_close, a.aktien_name, a.aktien_isin from kurse as k inner join aktien as a on (a.aktien_isin=k.kurs_isin) where k.kurs_isin='" + aktien_isin + "' and k.kurs_date > NOW() - INTERVAL '" + str(
+    global daysglobal
+    command = "SELECT k.kurs_date, k.kurs_close, a.aktien_name, a.aktien_isin, a.aktien_url from kurse as k inner join aktien as a on (a.aktien_isin=k.kurs_isin) where k.kurs_isin='" + aktien_isin + "' and k.kurs_date > NOW() - INTERVAL '" + str(
         zeitrahmen) + " days' order by kurs_date asc;"
     df = pd.read_sql(command, con=conn)
-    px = pd.DataFrame(df, columns=['kurs_date', 'kurs_close', 'aktien_name', 'aktien_isin'])
+    px = pd.DataFrame(df, columns=['kurs_date', 'kurs_close', 'aktien_name', 'aktien_isin', 'aktien_url'])
     #px['kurs_date'] = pd.to_datetime(px['kurs_date'])
     #px.index = px['kurs_date']
     #print(px)
@@ -487,6 +501,8 @@ def backtest_expert(aktien_isin, zeitrahmen, diagramm, zwitschern):
             order = order + 1
             if diagramm:
                 pyplot.plot(day, kurs_aktuell, "ro")
+        if (anzahl == 1):
+            daysglobal = daysglobal + 1
     # depot am ende ausleeren
     if (anzahl == 1):
         #print("Verkaufen: ", str(kurs_aktuell))
@@ -515,21 +531,25 @@ def backtest_expert(aktien_isin, zeitrahmen, diagramm, zwitschern):
         twitter = Twython(config.get('twitter', 'APP_KEY'), config.get('twitter', 'APP_SECRET'), config.get('twitter', 'OAUTH_TOKEN'), config.get('twitter', 'OAUTH_TOKEN_SECRET'))
         photo = open(akten_chart, 'rb')
         response = twitter.upload_media(media=photo)
-        tweet_title = str(px['aktien_name'][0]) + " - #" + str(px['aktien_isin'][0]) + " #"+px['aktien_name'][0].split(' ', 1)[0]
+        tweet_title = str(px['aktien_name'][0]) + " - #" + str(px['aktien_isin'][0]) + " #"+px['aktien_name'][0].split(' ', 1)[0] + " #" + str(px['aktien_url'][0])
         twitter.update_status(status=tweet_title, media_ids=[response['media_id']])
     else:
         pyplot.show()
+    pyplot.clf()
+    pyplot.cla()
+    pyplot.close()
     return prozent
 
 
 # alle kandiaten mit genug kursen backtesten und bilder erzeugen
-def backtest_alle_kandidaten(zeitrahmen):
+orderglobal=0
+daysglobal=0
+def backtest_alle_kandidaten(conn,zeitrahmen):
     kandidaten=0
     gewinne=0
     verluste=0
     gewinner=0
     verlierer=0
-    global conn
     cur = conn.cursor()
     cur.execute("""
                 select f.anzahl, a.aktien_isin, a.aktien_url, f.letzter from 
@@ -540,7 +560,7 @@ def backtest_alle_kandidaten(zeitrahmen):
                 where anzahl>%s;""",(zeitrahmen,))
     rows = cur.fetchall()
     for row in rows:
-        prozent=backtest_expert(row[1], zeitrahmen, False, False)
+        prozent=backtest_expert(conn, row[1], zeitrahmen, False, False)
         # zur verwendung bei kaufentscheidung merken
         cur.execute("update aktien set aktien_backtest=%s where aktien_isin=%s", (prozent, row[1],))
         if prozent > 0:
@@ -556,13 +576,13 @@ def backtest_alle_kandidaten(zeitrahmen):
     print ("Verluste: "+str(verluste))
     print ("Verlierer: "+str(verlierer))
     print ("Ordergesamt: "+str(orderglobal))
+    print ("Tage: "+str(daysglobal))
     cur.close()
     conn.commit()
 
 
 # pruefe alle papiere im depot auf buysell
-def depot_verkauf():
-    global conn
+def depot_verkauf(conn):
     cur = conn.cursor()
     cur.execute("""
                 select d.depot_isin, d.depot_anzahl, a.aktien_buysell, a.aktien_bid
@@ -577,8 +597,9 @@ def depot_verkauf():
             print("Verkaufen: "+row[0])
             quickorder = "V;EDE;" + row[0] + ";" + str(row[1]) + ";M"
             print("Order: " + quickorder)
-            onvista_quick_order(quickorder)
+            # onvista_quick_order(quickorder)
             cur.execute("delete from depot where depot_isin=%s;",(row[0],))
+            backtest_expert(row[0], 200, True, True)
         else:
             print(row[0] + ": " + str(row[1]) + " Aktien halten, Kurs: "+ str(row[3]))
     cur.close()
@@ -586,8 +607,7 @@ def depot_verkauf():
 
 
 # guckt nach wieviele aktien wir schon haben von dieser isin
-def aktien_isin_im_depot(aktien_isin):
-    global conn
+def aktien_isin_im_depot(conn,aktien_isin):
     cur = conn.cursor()
     cur.execute("select depot_anzahl from depot where depot_isin=%s;",(aktien_isin,))
     row = cur.fetchone()
@@ -600,8 +620,7 @@ def aktien_isin_im_depot(aktien_isin):
 
 
 # guckt nach wieviele positionen wir im depot haben
-def positionen_im_depot():
-    global conn
+def positionen_im_depot(conn):
     cur = conn.cursor()
     cur.execute("select count(depot_isin) as anzahl from depot;")
     row = cur.fetchone()
@@ -611,42 +630,64 @@ def positionen_im_depot():
 
 
 # kaufe kandidaten nach backtest und zwitschere
-def depot_einkauf():
-    global conn
+def depot_einkauf(conn):
     print ("*** Starte Einkaufprogramm ***")
     cur = conn.cursor()
     cur.execute("""
         select aktien_isin, aktien_name from kandidaten 
-        where aktien_buysell=1;
+        where aktien_buysell=1
+        order by aktien_deter desc;
     """)
     rows = cur.fetchall()
     for row in rows:
         print ("Kaufsignal: "+row[0]+" -> "+row[1])
         if (aktien_isin_im_depot(row[0])==0) and (positionen_im_depot()<5):
             kaufe_aktien(row[0], 2000)
-			backtest_expert(row[0],200,True,True)
+            backtest_expert(row[0], 200, True, True)
 
 
-def xetra_trading_bot():
-    stunde = 9
-    wochentag = 1
-    while ((stunde >= 9) and (stunde < 18) and (wochentag>0) and (wochentag<6)):
+def aktuelle_stunde():
+    return int(time.strftime("%H"))
+def aktueller_wochentag():
+    return int(time.strftime("%w"))
+def xetra_trading_bot(conn):
+    print ("*** Starte XETRA-Trading-Bot wenn alleine zur Handelszeit ***")
+    while ((aktuelle_stunde() >= 9) and (aktuelle_stunde() < 17) and (aktueller_wochentag() >= 1) and (aktueller_wochentag() <= 5)) and (allein_zu_haus()==True):
         try:
-            hole_alle_aktien_kurse()
-            bewerte_alle_aktien()
-            depot_verkauf()
-            depot_einkauf()
+            hole_alle_aktien_kurse(conn)
+            hole_alle_historischen_kurse(conn)
+            bewerte_alle_aktien(conn)
+            depot_verkauf(conn)
+            depot_einkauf(conn)
         except:
             pass
         print("*** Wartepause ***")
-        stunde = int(time.strftime("%H"))
-        wochentag = int(time.strftime("%w"))
         time.sleep(300)
+    print ("*** XETRA-Trading-Bot beendet ***")
+
 
 
 # main
 config = ConfigParser.RawConfigParser()
 config.read(os.path.expanduser("~/bullenfunk.ini"))
 conn = psycopg2.connect("dbname='bullenfunk' user='"+config.get('postgresql', 'pguser')+"' host='localhost' password='"+config.get('postgresql', 'pgpass')+"'")
-xetra_trading_bot()
+#
+#create_db(conn)
+#hole_alle_aktien_kurse(conn)
+#hole_alle_historischen_kurse(conn)
+bewerte_alle_aktien(conn)
+backtest_alle_kandidaten(conn,200)
+#
+#depot_verkauf()
+#depot_einkauf()
+#onvista_depot_inventur()
+#print (positionen_im_depot())
+#backtest_expert("DE000PSM7770",200,True,False)
+#
+#
+#
+#xetra_trading_bot()
+#
+#
+#
 conn.close()
