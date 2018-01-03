@@ -14,14 +14,13 @@ import time
 import os.path
 import locale
 import psycopg2
-import pyautogui
 import subprocess
 import pandas as pd
 import numpy as np
 import holidays
 import tempfile
-from tqdm import tqdm
 import configparser as ConfigParser
+from tqdm import tqdm
 from twython import Twython
 from matplotlib import pyplot
 from sklearn import linear_model
@@ -88,7 +87,7 @@ def create_db(conn):
         conn.commit()
     except:
         print (exception)
-        exit(1)
+        sys.exit(1)
 
 
 # kind of value function
@@ -118,14 +117,26 @@ def rsi(prices):
 # stratgie implementierung
 def expert_advisor(px,deter,performance,vorhersage):
     buysell = 0
-    # kaufsignal
-    if (performance > 0.02) and (deter > 0.90):
+    letzter=len(px)-1
+    schnitt=float(px['kurs_close'].median())
+    # kaufsignal entsprechend der strategie
+    if (performance > 0.02) and (deter > 0.90) and (px['kurs_close'][letzter]>schnitt):
         buysell = 1
     # kurs nicht mehr bullish, raus damit!
-    if (performance < 0.00):
+    if (performance < 0.00) or (px['kurs_close'][letzter]<schnitt):
         buysell = -1
     # das wars schon
     return buysell
+
+
+# so machen wir den browser auf
+def browser_aufmachen():
+    chromeOptions = webdriver.ChromeOptions()
+    chromeOptions.add_argument("--start-maximized")
+    prefs = {"profile.managed_default_content_settings.images": 2}
+    chromeOptions.add_experimental_option("prefs", prefs)
+    driver = webdriver.Chrome('c:\\Python36\chromedriver.exe',chrome_options=chromeOptions)
+    return (driver)
 
 
 # holt alle realtimekurse von boerse online
@@ -133,7 +144,7 @@ def update_aktien_realtime_boerse(conn,url):
     print ("*** Hole Kurse von "+url+" ***")
     locale.setlocale(locale.LC_ALL, 'deu_deu')
     cur = conn.cursor()
-    driver = webdriver.Chrome('c:\\Python36\chromedriver.exe')
+    driver = browser_aufmachen()
     driver.get(url)
     while not(page_has_loaded(driver)):
         time.sleep(1)
@@ -173,9 +184,6 @@ def update_aktien_realtime_boerse(conn,url):
 def optimierte_lineare_regression(df):
     letzter = len(df['kurs_close'])-1
     reg = linear_model.LinearRegression(n_jobs=1)
-    #df['kurs_date2'] = pd.to_datetime(df['kurs_date'])
-    #df['date_delta'] = (df['kurs_date2'] - df['kurs_date2'].min()) / np.timedelta64(1, 'D')
-    #tage = df[['date_delta']]
     df['tage'] = range(0,letzter+1)
     kurse = df['kurs_close']
     tage=df[['tage']]
@@ -184,31 +192,26 @@ def optimierte_lineare_regression(df):
     for i in range(0, (letzter // 5 * 4)):
         reg.fit(tage[i:letzter], kurse[i:letzter])
         df.loc[i,'score']=reg.score(tage[i:letzter], kurse[i:letzter])
-    df['scoremean']=df['score'].rolling(window=3,center=True).mean()
-    bestfit=df['scoremean'].idxmax()
-    #bestscore=df['scoremean'][bestfit]
-    #print (bestfit,bestscore)
-    #trenddays = df['date_delta'][letzter] - df['date_delta'][bestfit]
+    # kurve der bestimmheitsmasse glaetten und beste stelle finden
+    scoremean=df['score'].rolling(window=3,center=True).mean()
+    bestfit=scoremean.idxmax()
     trenddays=letzter-bestfit
     reg.fit(tage[bestfit:letzter], kurse[bestfit:letzter])
     # und dann erst vorhersage auf basis des besten fits
-    #df['kurs_predict'] = reg.predict(df[['date_delta']])
-    df['kurs_predict'] = reg.predict(tage)
-    aktie_deter = df['score'][bestfit] #reg.score(tage[bestfit:letzter], kurse[bestfit:letzter])
-    performance = reg.coef_[0]
-    vorhersage=df['kurs_predict']
-    #residuen=kurse[bestfit:letzter]-vorhersage[bestfit:letzter]
-    #vorhersage=vorhersage+residuen.min() # plus negative werte
+    aktie_deter = df['score'][bestfit]
+    performance = reg.coef_[0] / df['kurs_close'][bestfit] * letzter
+    vorhersage = reg.predict(tage)
     return (aktie_deter,performance,trenddays,vorhersage)
 
 
 # komplette bewertung der aktie
 def aktien_rating(conn,kurs_isin):
-    # alle kursdaten holen, schon aufsteigend sortiert
-    zeitrahmen = 233
-    command = """SELECT k.kurs_date, k.kurs_close from kurse as k 
-                 where kurs_isin='""" + kurs_isin + """' and kurs_date > NOW() - INTERVAL '""" + str(zeitrahmen) + """ days' 
-                 order by kurs_date asc;"""
+    # 200 letzte kursdaten holen, schon aufsteigend sortiert
+    command = """select * from (
+                    select * from kurse 
+                    where kurs_isin='""" + kurs_isin + """' 
+                    order by kurs_date desc limit 200
+                ) as foo order by kurs_date asc;"""
     df = pd.read_sql(command, con=conn)
     aktie_deter, performance, trenddays, vorhersage = optimierte_lineare_regression(df)
     # EA aufrufen
@@ -226,16 +229,14 @@ def aktien_rating(conn,kurs_isin):
 def hole_historische_kurse_boerse(conn,aktien_isin):
     locale.setlocale(locale.LC_ALL, 'deu_deu')
     cur = conn.cursor()
-    options = webdriver.ChromeOptions()
-    options.add_argument("--start-maximized")
-    driver = webdriver.Chrome('c:\\Python36\chromedriver.exe',chrome_options=options)
+    driver = browser_aufmachen()
     driver.get("http://www.boerse-online.de/")
     el=driver.find_element_by_id("searchvalue")
     time.sleep(3)
     el.click()
     el.send_keys(aktien_isin)
     el.submit()
-    time.sleep(5)
+    time.sleep(3)
     while not(page_has_loaded(driver)):
         time.sleep(1)
     el = driver.find_element_by_link_text("Historisch")
@@ -248,7 +249,7 @@ def hole_historische_kurse_boerse(conn,aktien_isin):
             break
     el = driver.find_element_by_id("request-historic-price")
     el.click()
-    time.sleep(5)
+    time.sleep(3)
     html = driver.page_source
     soup = BeautifulSoup(html, "html.parser")
     for row in soup.find_all("tr"):
@@ -321,10 +322,14 @@ def onvista_login_desktop(driver):
     el = driver.find_element_by_link_text("Sicherheitstastatur ausblenden")
     el.send_keys(Keys.RETURN)
     time.sleep(3)
-    el= driver.find_element_by_name('login')
-    el.send_keys(username)
     el= driver.find_element_by_name('password')
-    el.send_keys(password)
+    for char in password:
+        el.send_keys(char)
+        time.sleep(0.2)
+    el= driver.find_element_by_name('login')
+    for char in username:
+        el.send_keys(char)
+        time.sleep(0.2)
     time.sleep(3)
     el = driver.find_element_by_id('performLoginButton')
     el.send_keys(Keys.RETURN)
@@ -349,7 +354,7 @@ def wait_for_xpath_element(driver,xpathstr):
 # login und aktien kaufen im browser
 def onvista_quick_order(aktien_order):
     # browser auf zum einloggen
-    driver = webdriver.Chrome('c:\\Python36\chromedriver.exe')
+    driver = browser_aufmachen()
     driver.get("https://webtrading.onvista-bank.de/login")
     assert "onvista" in driver.title
     onvista_login_desktop(driver)
@@ -376,7 +381,7 @@ def onvista_quick_order(aktien_order):
 # depot auf onvista aufmachen und db update
 def onvista_depot_inventur(conn):
     # browser auf zum einloggen
-    driver = webdriver.Chrome('c:\\Python36\chromedriver.exe')
+    driver = browser_aufmachen()
     driver.get("https://webtrading.onvista-bank.de/login")
     assert "onvista" in driver.title
     onvista_login_desktop(driver)
@@ -407,7 +412,7 @@ def onvista_depot_inventur(conn):
             cur.execute("delete from depot where depot_isin = %s;", (row[0],))
     cur.close()
     conn.commit()
-    time.sleep(10)
+    time.sleep(100)
     driver.quit()
 
 
@@ -474,7 +479,9 @@ def backtest_expert(conn, aktien_isin, zeitrahmen, diagramm, zwitschern):
     if diagramm or zwitschern:
         kurse = px['kurs_close']
         tage = range(0, len(kurse))
+        schnitt = kurse.median()
         plot_title =  str(px['aktien_name'][letzter]) + " - " + str(px['aktien_isin'][letzter])
+        pyplot.plot((0,letzter), (schnitt,schnitt), color='blue', linewidth=1, linestyle="dotted")
         pyplot.title(plot_title)
         pyplot.plot(tage, kurse, color='black', linewidth=2)
         #sma90 = px['kurs_close'].rolling(window=90).mean()
@@ -634,12 +641,12 @@ def depot_einkauf(conn):
 # zeige einen plot der korrelation zu backtest und bestimmtheit
 def backtest_korrelation_scatter(conn):
     cursor = conn.cursor()
-    cursor.execute('select aktien_backtest, aktien_deter, aktien_perf, aktien_days from aktien where aktien_buysell=1');
+    cursor.execute('select aktien_backtest, aktien_deter, aktien_perf, aktien_days from aktien;'); # where aktien_buysell=1');
     rows = cursor.fetchall()
     df = pd.DataFrame([[ij for ij in i] for i in rows])
     print (df)
     x=df[1]
-    y=df[0]
+    y=df[2]
     pyplot.scatter(x, y)
     pyplot.show()
 
@@ -677,12 +684,96 @@ def xetra_trading_bot(conn):
             bewerte_alle_aktien(conn)
             depot_verkauf(conn)
             depot_einkauf(conn)
+            website_html_export(conn)
         except:
             pass
         print("*** Wartepause ***")
         for i in tqdm(range(1,15),dynamic_ncols=True, desc="Minuten"):
             time.sleep(60)
     print ("*** XETRA-Trading-Bot beendet ***")
+
+
+def website_html_export(conn):
+    html_header="""<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="">
+    <link rel="icon" href="favicon.ico">
+    <title>Starter Template for Bootstrap</title>
+    <link href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://getbootstrap.com/docs/3.3/examples/starter-template/starter-template.css" rel="stylesheet">
+    <link href="https://cdn.datatables.net/1.10.16/css/jquery.dataTables.min.css" rel="stylesheet">
+    <script src="https://code.jquery.com/jquery-1.12.4.min.js"></script>
+    <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js"></script>
+    <script src="https://cdn.datatables.net/1.10.16/js/jquery.dataTables.min.js"></script>
+  </head>
+  <body>
+    <nav class="navbar navbar-inverse navbar-fixed-top">
+      <div class="container">
+        <div class="navbar-header">
+          <button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#navbar" aria-expanded="false" aria-controls="navbar">
+            <span class="sr-only">Toggle navigation</span>
+            <span class="icon-bar"></span>
+            <span class="icon-bar"></span>
+            <span class="icon-bar"></span>
+          </button>
+          <a class="navbar-brand" href="index.html">Bullenfunk</a>
+        </div>
+        <div id="navbar" class="collapse navbar-collapse">
+          <ul class="nav navbar-nav">
+            <li><a href="depot.html">Depot</a></li>
+            <li><a href="kaufen.html">Kaufen</a></li>
+            <li><a href="halten.html">Halten</a></li>
+            <li><a href="verkaufen.html">Verkaufen</a></li>
+          </ul>
+        </div><!--/.nav-collapse -->
+      </div>
+    </nav>
+    <div class="container">
+    """
+    html_footer="""   </div><!-- /.container -->
+    <script type="text/javascript">
+    $(document).ready(function() {
+    $('#example').DataTable();
+    } );
+    </script>
+  </body>
+</html>
+    """
+    html_title="""<img src="https://openclipart.org/image/800px/svg_to_png/12529/Peileppe-bull-head.png&disposition=attachment" 
+alt="bull head" title="bull head by  Peileppe ( https://openclipart.org/user-detail/Peileppe )" />"""
+    zielpfad=config.get('webserver', 'DocumentRoot')
+    print ("Export nach: "+zielpfad)
+    command = "select * from aktien;"
+    df = pd.read_sql(command, con=conn)
+    file = open(zielpfad+"kaufen.html", 'w+')
+    html = html_header + df[df['aktien_buysell'] == 1].to_html(index=False) + html_footer
+    html = html.replace('<table border="1" class="dataframe">','<table id="example" class="table table-striped table-bordered" cellspacing="0" width="100%">')
+    file.write(html)
+    file.close()
+    file = open(zielpfad+"halten.html", 'w+')
+    html = html_header + df[df['aktien_buysell'] == 0].to_html(index=False) + html_footer
+    html = html.replace('<table border="1" class="dataframe">','<table id="example" class="table table-striped table-bordered" cellspacing="0" width="100%">')
+    file.write(html)
+    file.close()
+    file = open(zielpfad+"verkaufen.html", 'w+')
+    html = html_header + df[df['aktien_buysell'] == -1].to_html(index=False) + html_footer
+    html = html.replace('<table border="1" class="dataframe">','<table id="example" class="table table-striped table-bordered" cellspacing="0" width="100%">')
+    file.write(html)
+    file.close()
+    command = "select * from depot;"
+    df = pd.read_sql(command, con=conn)
+    file = open(zielpfad+"depot.html", 'w+')
+    html = html_header + df.to_html(index=False) + html_footer
+    html = html.replace('<table border="1" class="dataframe">','<table id="example" class="table table-striped table-bordered" cellspacing="0" width="100%">')
+    file.write(html)
+    file.close()
+    file = open(zielpfad+"index.html", 'w+')
+    html = html_header + html_title + html_footer
+    file.write(html)
+    file.close()
 
 
 
@@ -697,15 +788,16 @@ conn = psycopg2.connect("dbname='bullenfunk' user='"+config.get('postgresql', 'p
 #hole_alle_aktien_kurse(conn)
 #hole_alle_historischen_kurse(conn)
 #bewerte_alle_aktien(conn)
+#website_html_export(conn)
 #onvista_depot_inventur(conn)
 #depot_verkauf(conn)
 #depot_einkauf(conn)
 #print (positionen_im_depot(conn))
+#hole_historische_kurse_boerse(conn,'DE0005232805')
 #print (aktien_isin_im_depot(conn,'DE0005140008'))
-#onvista_depot_inventur(conn)
 #kaufe_aktien(conn,"DE0005232805",2000)
-#backtest_aktuelle_kandidaten(conn,50,False)
-#backtest_expert(conn,"DE0005232805",200,True,False)
+#backtest_aktuelle_kandidaten(conn,200,False)
+#backtest_expert(conn,"DE0007257503",200,True,False)
 #backtest_korrelation_scatter(conn)
 #
 xetra_trading_bot(conn)
